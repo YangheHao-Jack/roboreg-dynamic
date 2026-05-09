@@ -1,0 +1,23 @@
+# Input config for `ros2 bag convert`. Merges two source bags into one
+# self-contained compressed bag.
+#
+# 1) The compressed bag from compress_bag — contains only the encoded
+#    /ffmpeg image topics (no metadata).
+# 2) The original bag, but ONLY the non-image topics (camera_info,
+#    joint_states, tf, robot_description). Image topics excluded since
+#    they're already in the compressed bag in encoded form.
+#
+# Adjust the URIs to match your specific bag paths.
+input_bags:
+  - uri: /media/jack/新加卷/26_04_13_displacement_0_1_x264
+    storage_id: mcap
+
+  - uri: /media/jack/新加卷/26_04_13_displacement_0_1
+    storage_id: mcap
+    topics:
+      - /lbr/joint_states
+      - /lbr/robot_description
+      - /tf
+      - /tf_static
+      - /zed/zed_node/left/camera_info
+      - /zed/zed_node/right/camera_info
