@@ -1,0 +1,10 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_INTRINSICS_SNIFF",
+        "library_path": "./libxr_intrinsics_layer.so",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Sniffs per-eye XrFovf + recommended resolution; publishes to /tmp/xr_intrinsics.sock"
+    }
+}
