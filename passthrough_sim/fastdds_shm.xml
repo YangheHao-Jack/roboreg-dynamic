@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Fast DDS shared-memory transport profile for the passthrough raw-image path.
+
+  Why: raw sensor_msgs/Image at native res is ~22 MB/frame. Fast DDS's default
+  SHM segment is too small to hold messages that large, so it silently falls
+  back to UDP loopback (fragmented into ~64 KB datagrams) — that is the ~39 ms
+  "wire" you measured. This profile gives SHM a 512 MB segment (holds ~20+
+  in-flight 22 MB frames) and keeps a UDP transport alongside it purely for
+  discovery / cross-host fallback safety.
+
+  Use: export FASTRTPS_DEFAULT_PROFILES_FILE (and FASTDDS_DEFAULT_PROFILES_FILE)
+  to this file in EVERY shell that launches a node on the pixel topics — the
+  producer (so the bridge sidecar inherits it), the launch, and the consumer.
+  Any participant that does NOT load this profile will still discover the others
+  over UDP, but its data hop will not use the big SHM segment.
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_big</transport_id>
+        <type>SHM</type>
+        <!-- 512 MB shared segment. Raise to 1073741824 (1 GB) if you see
+             "segment full" / dropped frames at higher rates. -->
+        <segment_size>536870912</segment_size>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>udp_disc</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="shm_default" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_big</transport_id>
+          <transport_id>udp_disc</transport_id>
+        </userTransports>
+        <!-- false = use ONLY the two transports above (deterministic). UDP is
+             present for discovery, so the graph still forms; same-host data
+             rides shm_big. -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>
