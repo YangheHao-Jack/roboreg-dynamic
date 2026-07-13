@@ -1096,6 +1096,10 @@ function getTransport(): Transport {
 // Read at session start. Priority: URL "?pose=" > the on-page dropdown > default (gt).
 const POSE_TOPIC_GT        = '/xr/extrinsic_left';
 const POSE_TOPIC_ESTIMATED = '/xr/extrinsic_left_estimated';
+function getBagView(): boolean {
+  return new URLSearchParams(window.location.search).get('bagview') === '1';
+}
+
 function getPoseTopic(): string {
   const p = new URLSearchParams(location.search).get('pose');
   if (p === 'estimated') return POSE_TOPIC_ESTIMATED;
@@ -1117,6 +1121,33 @@ async function startPoseFeedRosbridge(overlay: OverlayModule) {
   ros.on('close', () => console.warn('[overlay] rosbridge closed'));
   const _poseTopic = getPoseTopic();
   console.info(`[overlay] pose source: ${_poseTopic}`);
+  if (getBagView()) {
+    // Replay background: recorded stereo frames over rosbridge, decoded
+    // in-browser (WebCodecs) and drawn beneath the robot. ?bagview=1
+    let bagInit = false;
+    const b64ToU8 = (b64: string) =>
+      Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    new ROSLIB.Topic({
+      ros, name: '/xr/image_left/camera_info',
+      messageType: 'sensor_msgs/CameraInfo', queue_size: 1,
+    }).subscribe((ci: any) => {
+      if (bagInit) return;
+      bagInit = true;
+      overlay.enableBagBackground(
+        { fx: ci.k[0], fy: ci.k[4], width: ci.width, height: ci.height });
+    });
+    setTimeout(() => {                      // caminfo absent -> defaults
+      if (!bagInit) { bagInit = true; overlay.enableBagBackground(); }
+    }, 3000);
+    for (const eye of ['left', 'right'] as const) {
+      new ROSLIB.Topic({
+        ros, name: `/xr/image_${eye}/compressed`,
+        messageType: 'sensor_msgs/CompressedImage', queue_size: 1,
+      }).subscribe((m: any) => overlay.setBagFrame(eye, b64ToU8(m.data)));
+    }
+    console.info('[overlay] bag replay background enabled (?bagview=1)');
+  }
+
   new ROSLIB.Topic({
     ros, name: _poseTopic, messageType: 'geometry_msgs/PoseStamped',
     throttle_rate: 0, queue_length: 1,

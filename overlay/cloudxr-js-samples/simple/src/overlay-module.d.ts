@@ -32,6 +32,10 @@ export declare class OverlayModule {
     q: { x: number; y: number; z: number; w: number }
   ): void;
   setJoints(positions: ArrayLike<number>, names?: string[]): void;
+  enableBagBackground(camInfo?: { fx?: number; fy?: number;
+                                  width?: number; height?: number },
+                      depth?: number): void;
+  setBagFrame(eye: 'left' | 'right', data: Uint8Array): void;
 
   // robot loading
   loadURDF(url: string, opts?: LoadURDFOptions): Promise<unknown>;

@@ -84,6 +84,13 @@ export class OverlayModule {
     this.isaacConv = opts.isaacConv !== false;
 
     this.renderer = null;
+
+    // ── Bag-replay stereo background (optional; enableBagBackground()) ──
+    // Per-eye WebCodecs H.264 decoders -> canvas textures -> head-locked
+    // quads drawn BENEATH the robot (depthTest off, renderOrder -10), sized
+    // from the camera intrinsics so the recorded footage appears at the
+    // correct FOV. Eye-selective visibility is handled in render().
+    this._bag = null;
     this.refSpace = null;
     this._rt = null;
     this._urdfBaseURL = null;
@@ -227,6 +234,55 @@ export class OverlayModule {
   // Call from onXRFrame(timestamp, frame, gl, baseLayer) AFTER CloudXR has
   // drawn the streamed frame. baseLayer.framebuffer is already bound by the
   // sample; we render into it without clearing color.
+  // Build the replay background. camInfo: {fx, fy, width, height} (defaults
+  // to the Quest passthrough calibration if omitted); depth: quad distance [m].
+  enableBagBackground(camInfo = {}, depth = 2.0) {
+    const fx = camInfo.fx ?? 864.75, fy = camInfo.fy ?? 864.75;
+    const w = camInfo.width ?? 1280, h = camInfo.height ?? 1280;
+    const qw = depth * w / fx, qh = depth * h / fy;
+    const mk = (eye) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      const mat = new THREE.MeshBasicMaterial({
+        map: tex, depthTest: false, depthWrite: false, toneMapped: false });
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(qw, qh), mat);
+      mesh.renderOrder = -10;
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      mesh.matrixAutoUpdate = false;
+      this.scene.add(mesh);
+      let seq = 0;
+      const dec = new VideoDecoder({
+        output: (vf) => {
+          ctx.drawImage(vf, 0, 0, w, h);
+          vf.close();
+          tex.needsUpdate = true;
+        },
+        error: (e) => console.warn(`[bag-bg] ${eye} decoder:`, e.message),
+      });
+      dec.configure({ codec: 'avc1.42E02A', optimizeForLatency: true });
+      return { canvas, ctx, tex, mesh, dec, seq };
+    };
+    this._bag = { depth, left: mk('left'), right: mk('right'),
+                  _m: new THREE.Matrix4(), _off: new THREE.Matrix4()
+                      .makeTranslation(0, 0, -depth) };
+    console.info(`[bag-bg] enabled: quad ${qw.toFixed(2)}x${qh.toFixed(2)} m `
+                 + `at ${depth} m (fx=${fx}, ${w}x${h})`);
+  }
+
+  // Feed one H.264 access unit (Annex-B, all-intra) for one eye.
+  setBagFrame(eye, u8) {
+    if (!this._bag) return;
+    const s = this._bag[eye];
+    if (!s || s.dec.state !== 'configured') return;
+    if (s.dec.decodeQueueSize > 2) return;          // latest-wins (all-intra)
+    s.dec.decode(new EncodedVideoChunk(
+      { type: 'key', timestamp: s.seq++ * 16667, data: u8 }));
+  }
+
   render(frame, baseLayer) {
     if (!this.renderer || !this.refSpace || !this.poseApplied) return;
     const pose = frame.getViewerPose(this.refSpace);
@@ -274,6 +330,18 @@ export class OverlayModule {
       this.camera.matrixWorldNeedsUpdate = true;
       this.camera.projectionMatrix.fromArray(view.projectionMatrix);
       this.camera.projectionMatrixInverse.copy(this.camera.projectionMatrix).invert();
+      if (this._bag) {
+        // place THIS eye's quad head-locked in front of THIS eye; show only it
+        const isLeft = view.eye !== 'right';
+        const cur = isLeft ? this._bag.left : this._bag.right;
+        const oth = isLeft ? this._bag.right : this._bag.left;
+        this._bag._m.fromArray(view.transform.matrix)
+                    .multiply(this._bag._off);
+        cur.mesh.matrix.copy(this._bag._m);
+        cur.mesh.matrixWorldNeedsUpdate = true;
+        cur.mesh.visible = true;
+        oth.mesh.visible = false;
+      }
       this.renderer.render(this.scene, this.camera);
     }
     this.renderer.setRenderTarget(null);
