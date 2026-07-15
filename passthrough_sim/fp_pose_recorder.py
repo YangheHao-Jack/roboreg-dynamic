@@ -118,6 +118,12 @@ def parse_args():
                    help="Path to centered .obj. Required for overlays.")
     p.add_argument("--axis_length", type=float, default=0.1)
     p.add_argument("--mesh_subsample", type=int, default=2)
+    p.add_argument("--persistent", action="store_true",
+                   help="WARM-SEED MODE (with --init_only): after publishing "
+                        "an init, do NOT kill ESS/FP/depth_saver and do NOT "
+                        "exit. Instead subscribe /seed/arm (latched Bool) and "
+                        "publish ONE fresh /pose_init per arm rising edge — "
+                        "the resident seed stack re-initialises on demand.")
     p.add_argument("--init_only", action="store_true",
                    help="One-shot init mode: wait for first FP pose, "
                         "latched-publish /pose_init (PoseStamped), kill "
@@ -517,6 +523,14 @@ class PoseRecorder(Node):
             self._pose_init_pub = self.create_publisher(
                 PoseStamped, args.pose_init_topic, latched_qos)
             self._pid_dir = Path(args.pid_dir)
+            self._persistent = bool(getattr(args, 'persistent', False))
+            if self._persistent:
+                from std_msgs.msg import Bool
+                self.create_subscription(
+                    Bool, '/seed/arm', self._on_seed_arm, latched_qos)
+                self.get_logger().info(
+                    "PERSISTENT: will publish one fresh /pose_init per "
+                    "/seed/arm rising edge; no teardown, no exit.")
             self.get_logger().info(
                 f"INIT-ONLY MODE: waiting for first pose, will latched-publish "
                 f"on {args.pose_init_topic}, then kill PIDs from {self._pid_dir}")
@@ -882,6 +896,15 @@ class PoseRecorder(Node):
         if self.do_overlay:
             self._render_init_overlay(T_cam_centered, T_cam_link0)
 
+        if getattr(self, '_persistent', False):
+            # Warm-seed: the stack stays resident; this recorder stays up and
+            # waits for the next /seed/arm rising edge. FP idles as soon as
+            # the gate closes (no seg/depth tuples), so no teardown is needed.
+            self.get_logger().info(
+                "INIT: published (persistent) — stack stays resident; "
+                "waiting for the next /seed/arm.")
+            return
+
         # Kill upstream: depth_saver via PID file; FP/ESS via cmdline pkill.
         log = self.get_logger()
         kill_pid_file(self._pid_dir / "depth_saver.pid", "depth_saver", log)
@@ -900,6 +923,12 @@ class PoseRecorder(Node):
             except Exception:
                 pass
         self._shutdown_timer = self.create_timer(5.0, _self_shutdown)
+
+    def _on_seed_arm(self, msg):
+        if bool(msg.data) and self._init_done:
+            self._init_done = False           # accept the next clean pose
+            self.get_logger().info(
+                "PERSISTENT: /seed/arm rising edge — armed for a fresh init")
 
     def _render_init_overlay(self, T_cam_centered, T_cam_link0):
         """One-shot overlay render for init debug. Saves PNG(s) at the

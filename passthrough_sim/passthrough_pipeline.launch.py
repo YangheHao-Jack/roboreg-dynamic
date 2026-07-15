@@ -58,7 +58,7 @@ PID_DIR = "/tmp/fp_init_pids"
 BAKE_DIR = "/tmp/fp_bake_runtime"
 
 
-def _clean_runtime_dirs(_context):
+def _clean_runtime_dirs(context):
     import shutil
     for d in (PID_DIR, BAKE_DIR):
         p = Path(d)
@@ -123,6 +123,20 @@ def generate_launch_description():
         "stereo_extrinsics_topic", default_value="/xr/baseline")
 
     # ESS / FP toggles + assets.
+    depth_viz_arg = DeclareLaunchArgument(
+        "depth_viz_dir", default_value="",
+        description="If set, the ESS depth_saver also writes coloured depth "
+                    "+ disparity PNGs there (depth_viz/ and disparity_viz/ "
+                    "subdirs). Debug instrument; empty = off.")
+    seed_warm_arg = DeclareLaunchArgument(
+        "seed_warm", default_value="false", choices=["true", "false"],
+        description="WARM seed: keep ESS+FP+depth_saver+recorder RESIDENT "
+                    "with ESS's inputs remapped behind the seed_gate valve. "
+                    "Idle cost = VRAM only (gate closed -> ESS receives "
+                    "nothing, FP idles without seg). Re-init = /seed/arm "
+                    "(or the consumer's 'r' key): gate opens, FP seeds, the "
+                    "persistent recorder publishes a fresh /pose_init, the "
+                    "consumer disarms, gate closes.")
     enable_ess_arg = DeclareLaunchArgument(
         "enable_ess", default_value="true", choices=["true", "false"],
         description="Run ESS stereo depth (ess_launch + depth_saver).")
@@ -132,6 +146,22 @@ def generate_launch_description():
     enable_recorder_arg = DeclareLaunchArgument(
         "enable_recorder", default_value="true", choices=["true", "false"],
         description="Run fp_pose_recorder (init_only) → latched /pose_init.")
+    stereo_backend_arg = DeclareLaunchArgument(
+        "stereo_backend", default_value="ess", choices=["ess", "fs"],
+        description="Stereo depth for the seed path: ess (fast, default) or "
+                    "fs (FoundationStereo — foundation-model quality depth "
+                    "for FP seeding; heavier per frame, which the seed path "
+                    "doesn't care about). The FS graph is namespaced under "
+                    "/fs with only its endpoints remapped: inputs from the "
+                    "pipeline's already-rectified stream (its internal "
+                    "rectify is an identity under camera_info_rect's zero "
+                    "distortion; resize/pad are no-ops at 960x576), "
+                    "/disparity back to global for the depth_saver.")
+    fs_engine_arg = DeclareLaunchArgument(
+        "fs_engine_file_path",
+        default_value=str(
+            ISAAC_ROS_WS / "isaac_ros_assets/models/foundationstereo"
+            / "deployable_v2.0/foundationstereo_576x960.engine"))
     ess_engine_arg = DeclareLaunchArgument(
         "ess_engine_file_path",
         default_value=str(
@@ -206,6 +236,68 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("enable_fp")),
     )
 
+    # ── FoundationStereo (namespaced /fs; endpoints remapped) ─────────
+    from launch.actions import GroupAction
+    from launch_ros.actions import SetRemap, PushRosNamespace
+
+    # FoundationStereo via OUR minimal composition (fs_seed.launch.py in
+    # this folder): the packaged include's rectify/resize/pad stages are
+    # geometric no-ops for our already-rectified 960x576 rgb8 stream and
+    # only added the stamp-sync surfaces it was failing on. Inputs are
+    # remapped first-class inside the composition; decoder consumes the
+    # right rect camera_info directly; output is /fs/disparity.
+    def _fs_seed(prefix):
+        return IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                str(PASSTHROUGH_DIR / "fs_seed.launch.py")),
+            launch_arguments={
+                "engine_file_path":
+                    LaunchConfiguration("fs_engine_file_path"),
+                "input_left":  f"{prefix}/left/image_rect",
+                "input_right": f"{prefix}/right/image_rect",
+                "input_left_camera_info":
+                    f"{prefix}/left/camera_info_rect",
+                "input_right_camera_info":
+                    f"{prefix}/right/camera_info_rect",
+            }.items(),
+        )
+
+    fs_launch = _fs_seed("")
+    fs_launch_warm = _fs_seed("/seed")
+
+    # ── WARM-SEED variants: ESS behind the gate, recorder persistent ──
+    ess_launch_warm = GroupAction(
+        actions=[
+            SetRemap("/left/image_rect",        "/seed/left/image_rect"),
+            SetRemap("/right/image_rect",       "/seed/right/image_rect"),
+            SetRemap("/left/camera_info",       "/seed/left/camera_info_rect"),
+            SetRemap("/right/camera_info",      "/seed/right/camera_info_rect"),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    PathJoinSubstitution([
+                        FindPackageShare("isaac_ros_ess"),
+                        "launch", "isaac_ros_ess.launch.py"])
+                ]),
+                launch_arguments={
+                    "engine_file_path": LaunchConfiguration("ess_engine_file_path"),
+                    "threshold":        LaunchConfiguration("ess_threshold"),
+                }.items(),
+            ),
+        ],
+        scoped=True, forwarding=True,
+    )
+    seed_gate_node = ExecuteProcess(
+        cmd=["python", str(PASSTHROUGH_DIR / "seed_gate.py"),
+             "--start-armed"],
+        output="screen",
+    )
+    pose_recorder_warm = ExecuteProcess(
+        cmd=["python", "-u", str(PASSTHROUGH_DIR / "fp_pose_recorder.py"),
+             "--init_only", "--persistent",
+             "--offset_npy", f"{BAKE_DIR}/lbr_med7_baked_offset.npy"],
+        output="screen",
+    )
+
     # ── The rectifier ────────────────────────────────────────────────
     # RAW_IMAGES=1 in the launch environment switches the rectifier to raw
     # rgb8 Image input (matches the producer's --raw-images). --raw-input
@@ -229,10 +321,19 @@ def generate_launch_description():
     )
 
     # ── ESS depth republisher + FP init recorder ────────────────────
+    depth_saver_fs = ExecuteProcess(
+        cmd=["python", str(PASSTHROUGH_DIR / "stereo_depth_saver.py"),
+             "--backend", "fs",
+             "--disparity_topic", "/fs/disparity",
+             "--pid_file", f"{PID_DIR}/depth_saver.pid",
+             "--viz_dir", LaunchConfiguration("depth_viz_dir")],
+        output="screen",
+    )
     depth_saver = ExecuteProcess(
         cmd=["python", str(PASSTHROUGH_DIR / "stereo_depth_saver.py"),
              "--backend", "ess",
-             "--pid_file", f"{PID_DIR}/depth_saver.pid"],
+             "--pid_file", f"{PID_DIR}/depth_saver.pid",
+             "--viz_dir", LaunchConfiguration("depth_viz_dir")],
         output="screen",
         condition=IfCondition(LaunchConfiguration("enable_ess")),
     )
@@ -261,15 +362,47 @@ def generate_launch_description():
         rc = getattr(event, "returncode", None)
         have_obj = os.path.exists(BAKED_OBJ)
         have_off = os.path.exists(BAKED_OFFSET)
+        warm = context.perform_substitution(
+            LaunchConfiguration("seed_warm")) == "true"
+        fs = context.perform_substitution(
+            LaunchConfiguration("stereo_backend")) == "fs"
+        stereo_normal = fs_launch if fs else ess_launch
+        stereo_warm = fs_launch_warm if fs else ess_launch_warm
+        ds = depth_saver_fs if fs else depth_saver
         if rc == 0 and have_obj and have_off:
+            if warm:
+                # WARM: ESS remapped behind the gate. The gate starts ARMED,
+                # so the first init behaves EXACTLY like the proven ungated
+                # path (frames reach ESS from the first rectified frame; no
+                # arm race, no dying latch). The consumer's ReInitManager —
+                # created right after its handoff — publishes its startup
+                # arm=false, closing the gate at precisely the right moment;
+                # the stack then idles resident until the next 'r'.
+                return [
+                    LogInfo(msg="[stage1-warm] bake OK — starting RESIDENT "
+                                "seed stack (gate ARMED + ESS@/seed + FP)"),
+                    seed_gate_node,
+                    stereo_warm,
+                    fp_launch,
+                    TimerAction(period=4.0, actions=[
+                        LogInfo(msg="[stage2] starting rectifier + depth_saver"),
+                        rectifier,
+                        ds,
+                    ]),
+                    TimerAction(period=6.0, actions=[
+                        LogInfo(msg="[stage2b-warm] starting PERSISTENT "
+                                    "pose recorder"),
+                        pose_recorder_warm,
+                    ]),
+                ]
             return [
-                LogInfo(msg="[stage1] bake OK — starting ESS + FP"),
-                ess_launch,
+                LogInfo(msg="[stage1] bake OK — starting stereo depth + FP"),
+                stereo_normal,
                 fp_launch,
                 TimerAction(period=4.0, actions=[
                     LogInfo(msg="[stage2] starting rectifier + depth_saver"),
                     rectifier,
-                    depth_saver,
+                    ds,
                 ]),
                 TimerAction(period=6.0, actions=[
                     LogInfo(msg="[stage2b] starting pose recorder (init_only)"),
@@ -291,8 +424,14 @@ def generate_launch_description():
         )
     )
 
+    def _stage0(context):
+        return [LogInfo(
+            msg="[stage0] baking mesh — press A once joints flow")]
+
     from launch.actions import OpaqueFunction
     return LaunchDescription([
+        depth_viz_arg,
+        seed_warm_arg, stereo_backend_arg, fs_engine_arg,
         urdf_path_arg, joint_topic_arg, joint_prefix_arg,
         left_image_arg, right_image_arg,
         left_caminfo_arg, right_caminfo_arg, extrinsics_arg,
@@ -301,7 +440,7 @@ def generate_launch_description():
         enable_bag_arg, bag_dir_arg, bag_topics_arg, bag_storage_arg,
         OpaqueFunction(function=_clean_runtime_dirs),
         OpaqueFunction(function=_start_recorder),
-        LogInfo(msg="[stage0] baking mesh — press A once joints flow"),
+        OpaqueFunction(function=_stage0),
         bake_node,
         after_bake,
     ])

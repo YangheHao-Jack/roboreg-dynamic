@@ -136,6 +136,31 @@ class BagH264Source(Node):
         self._n_l = self._n_r = self._n_js = 0
         self._warm_l = self._warm_r = False
 
+        # Re-freeze on demand (/seed/arm, latched Bool): during playback,
+        # arming re-enters a freeze on the MOST RECENT IDR access unit per eye
+        # (cached continuously below — the stream carries an IDR every ~0.5 s,
+        # so the frozen picture is effectively "now"). FP gets the stable view
+        # a re-initialisation needs; a fresh /pose_init releases, and playback
+        # resumes with stamps/pacing shifted by the frozen duration.
+        self._refreeze_req = False
+        self._armed_state = False
+        self._refreeze_au = {True: None, False: None}   # is_left -> headers+IDR
+        self._refreeze_hdr = {True: b"", False: b""}    # cached SPS/PPS per eye
+        try:
+            from std_msgs.msg import Bool
+            arm_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST, depth=1)
+            self.create_subscription(Bool, '/seed/arm', self._on_arm, arm_qos)
+            # Freeze-state broadcast: the consumer pauses estimation while
+            # this is true, binding its pause to the ACTUAL stream state
+            # instead of racing the arm signal.
+            self._frozen_pub = self.create_publisher(Bool, '/seed/frozen',
+                                                     arm_qos)
+        except Exception as e:
+            self.get_logger().warn(f"/seed/arm subscription unavailable: {e}")
+
         # Freeze gate: hold the first frame until /pose_init latches (FP needs a
         # stable view to seed; we must not stream past it before the handoff).
         self._pose_init_seen = False
@@ -156,6 +181,77 @@ class BagH264Source(Node):
         if not self._pose_init_seen:
             self._pose_init_seen = True
             self.get_logger().info("/pose_init received --- releasing freeze")
+
+    def _on_arm(self, msg):
+        want = bool(msg.data)
+        self._armed_state = want
+        if want and not self._refreeze_req:
+            self._refreeze_req = True
+            self.get_logger().info(
+                "/seed/arm --- will RE-FREEZE on the latest IDR for "
+                "re-initialisation")
+        elif not want and self._refreeze_req:
+            self._refreeze_req = False
+            self.get_logger().info(
+                "/seed/arm cleared --- pending re-freeze cancelled")
+
+    def _cache_refreeze_au(self, is_left, payload):
+        """Track headers + the newest self-contained IDR AU per eye."""
+        types = self._nal_types(payload)
+        self._refreeze_hdr[is_left] += self._split_header_nals(payload)
+        if 5 in types:
+            self._refreeze_au[is_left] = (
+                payload if {7, 8} & types
+                else self._refreeze_hdr[is_left] + payload)
+
+    def _refreeze_phase(self, last_stamp_ns):
+        """Hold the cached latest-IDR AUs at freeze_hz until a FRESH
+        /pose_init arrives (the existing latched original cannot re-fire this
+        subscription — transient_local redelivers only to NEW subscriptions).
+        Returns the frozen duration in ns so run() shifts stamps + pacing."""
+        a = self.args
+        if self._refreeze_au[True] is None or self._refreeze_au[False] is None:
+            if not getattr(self, '_refreeze_wait_logged', False):
+                self._refreeze_wait_logged = True
+                self.get_logger().info(
+                    "re-freeze requested before an IDR was cached --- "
+                    "will freeze at the next IDR (<= one GOP away)")
+            return 0                       # request stays pending; retried
+        self._refreeze_req = False
+        self._refreeze_wait_logged = False
+        self._pose_init_seen = False          # re-arm the release gate
+        from std_msgs.msg import Bool
+        _b = Bool(); _b.data = True
+        self._frozen_pub.publish(_b)
+        self.get_logger().info(
+            f"RE-FREEZE: holding latest IDR AU per eye at "
+            f"{a.freeze_hz:.0f} Hz until a fresh '{a.pose_init_topic}' ...")
+        hold_dt = 1.0 / max(a.freeze_hz, 1.0)
+        rel_ns = 0
+        self._armed_state = True
+        while (rclpy.ok() and not self._pose_init_seen
+               and self._armed_state):
+            stamp = Time(nanoseconds=last_stamp_ns + rel_ns).to_msg()
+            for is_left, pub in ((True, self.pub_cmp_l),
+                                 (False, self.pub_cmp_r)):
+                m = CompressedImage()
+                m.header.stamp = stamp
+                m.header.frame_id = (a.left_frame_id if is_left
+                                     else a.right_frame_id)
+                m.format = "h264"
+                m.data = self._refreeze_au[is_left]
+                pub.publish(m)
+            rel_ns += int(hold_dt * 1e9)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            time.sleep(hold_dt)
+        _b = Bool(); _b.data = False
+        self._frozen_pub.publish(_b)
+        why = ("fresh /pose_init" if self._pose_init_seen
+               else "disarmed (aborted)")
+        self.get_logger().info(
+            f"RE-FREEZE released after {rel_ns/1e9:.1f}s ({why}) "
+            f"--- resuming playback")
+        return rel_ns
 
     # ---- decode + publish one eye --------------------------------------------
     def _decode_hwc(self, dec, payload):
@@ -567,6 +663,8 @@ class BagH264Source(Node):
                     if a.republish_compressed:
                         # Forward the H.264 CompressedImage unchanged (re-stamped);
                         # the rectifier's NVDEC does the decode.
+                        payload = bytes(msg.data)
+                        self._cache_refreeze_au(is_left, payload)
                         msg.header.stamp = stamp_msg
                         msg.header.frame_id = (a.left_frame_id if is_left
                                                else a.right_frame_id)
@@ -575,7 +673,23 @@ class BagH264Source(Node):
                             self._n_l += 1
                         else:
                             self._n_r += 1
+                        if self._refreeze_req:
+                            frozen_ns = self._refreeze_phase(
+                                synth_base_ns + rel_ns)
+                            # Shift the synthetic clock AND the wall pacing by
+                            # the frozen duration: stamps stay monotonic and
+                            # the rate pacer doesn't burst to "catch up".
+                            synth_base_ns += frozen_ns
+                            wall_t0 += frozen_ns / 1e9
                     elif is_left:
+                        if self._refreeze_req and not getattr(
+                                self, '_raw_refreeze_warned', False):
+                            self._raw_refreeze_warned = True
+                            self.get_logger().warn(
+                                "re-freeze requested but the source runs in "
+                                "RAW mode (--republish-compressed off) --- "
+                                "re-freeze is compressed-only; playback "
+                                "continues UNFROZEN")
                         if self._emit_image(self.dec_l, self.pub_img_l, msg.data,
                                             stamp_msg, "L"):
                             self._n_l += 1
