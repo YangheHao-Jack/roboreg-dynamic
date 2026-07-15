@@ -922,10 +922,21 @@ def create_optimizer_visualization(final_pL, final_pR, probL_t, probR_t, imgL_t,
     #               no segmentation panels generated).
     # 'left_only':  1x2 strip [overlay_L | seg_L] (no right cam panels).
     # '2x2' (default): both cams + their seg side-by-side and stacked.
+    # '3x2': the stereo_ipcai_pipeline reference view — per-camera columns of
+    #        [overlay / wireframe-DIFFERENCE / segmentation]. The diff panels
+    #        are |pred - gt| with wireframe contours (same construction the
+    #        save_frames dump uses).
     if overlay_only:
         combo = torch.cat([ovL, ovR], dim=2)
     elif layout == "left_only":
         combo = torch.cat([ovL, msL], dim=2)
+    elif layout == "3x2":
+        diff_baseL = ((predL.float() - gtL.float()).abs() * 255).to(torch.uint8).unsqueeze(0).repeat(3, 1, 1)
+        dfL = generate_wireframe_overlay(predL, gtL, base_image=diff_baseL, thickness=args.wireframe_thickness)
+        diff_baseR = ((predR.float() - gtR.float()).abs() * 255).to(torch.uint8).unsqueeze(0).repeat(3, 1, 1)
+        dfR = generate_wireframe_overlay(predR, gtR, base_image=diff_baseR, thickness=args.wireframe_thickness)
+        combo = torch.cat([torch.cat([ovL, dfL, msL], dim=1),
+                           torch.cat([ovR, dfR, msR], dim=1)], dim=2)
     else:
         combo = torch.cat([torch.cat([ovL, msL], dim=2),
                            torch.cat([ovR, msR], dim=2)], dim=1)

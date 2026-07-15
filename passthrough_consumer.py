@@ -107,7 +107,7 @@ class LiveSource(FrameSource):
     """
     def __init__(self, left_topic, right_topic, js_topic, device,
                  queue_size=2, slop_ms=50, compressed=False,
-                 image_codec="h264"):
+):
         super().__init__()
         import rclpy
         from rclpy.node import Node
@@ -115,14 +115,13 @@ class LiveSource(FrameSource):
         from sensor_msgs.msg import Image, CompressedImage, JointState
         import message_filters
 
-        # Native-res optimiser path reads the producer's H.264 stream
+        # Native-res optimiser path reads the producer's raw JPEG stream
         # (sensor_msgs/CompressedImage) directly; the rectified path reads
-        # raw sensor_msgs/Image.
+        # raw sensor_msgs/Image. srbag's decoder handles both.
         self._compressed = bool(compressed)
         self._img_msg_type = CompressedImage if self._compressed else Image
-        # Compressed-path codec: H.264 only (NVDEC engine, off the SMs).
-        # Per-eye NVDEC decoders are lazy (built on first frame).
-        self._image_codec = image_codec
+        # Compressed-path codec: 'jpeg' (nvJPEG, SMs) or 'h264' (NVDEC engine,
+        # off the SMs). Per-eye NVDEC decoders are lazy (built on first frame).
         self._h264_dec_l = None
         self._h264_dec_r = None
 
@@ -155,31 +154,8 @@ class LiveSource(FrameSource):
         self._pin_right = None
         self._pin_idx = 0
 
-        # Freshest-frame QoS on the image subscribers. The rectifier publishes
-        # /left|right/image_rect RELIABLE depth=10 (FP/ESS need that); a
-        # RELIABLE pub is compatible with a BEST_EFFORT sub, and on OUR side
-        # BEST_EFFORT depth=1 means rclpy never queues a backlog of 1.66 MB
-        # frames that --live-latest-only would discard anyway. Pairing still
-        # happens in the ApproximateTimeSynchronizer (its own queue below).
-        from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
-                               QoSHistoryPolicy)
-        img_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1)
-        sub_l = message_filters.Subscriber(
-            self.node, self._img_msg_type, left_topic, qos_profile=img_qos)
-        sub_r = message_filters.Subscriber(
-            self.node, self._img_msg_type, right_topic, qos_profile=img_qos)
-        # Diagnostic counters: localize a dead feed in one run (printed on
-        # read() timeout). Which stage starved: raw arrivals -> sync pairs ->
-        # js gate -> queue -> decode.
-        self._diag = {"l": 0, "r": 0, "pairs": 0, "js_gated": 0,
-                      "queued": 0, "dec_none": 0}
-        sub_l.registerCallback(lambda m: self._diag.__setitem__(
-            "l", self._diag["l"] + 1))
-        sub_r.registerCallback(lambda m: self._diag.__setitem__(
-            "r", self._diag["r"] + 1))
+        sub_l = message_filters.Subscriber(self.node, self._img_msg_type, left_topic)
+        sub_r = message_filters.Subscriber(self.node, self._img_msg_type, right_topic)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [sub_l, sub_r], queue_size=10, slop=slop_ms / 1000.0)
         self.sync.registerCallback(self._cb_stereo)
@@ -208,13 +184,22 @@ class LiveSource(FrameSource):
             self.latest_js = js
 
     def _cb_stereo(self, msg_l, msg_r):
-        self._diag["pairs"] += 1
         if self._compressed:
-            # Defer the decode to read() (the optimiser thread) so it is
-            # sequenced with seg/opt on one thread rather than firing from the
-            # ROS spin thread at arbitrary times. Buffer only the compressed
-            # bytes here; _read_impl decodes them inline.
-            frame = {'raw_l': bytes(msg_l.data), 'raw_r': bytes(msg_r.data)}
+            # Decode EVERY access unit here, in arrival order (the single-
+            # threaded executor guarantees ordering). H.264 streams from the
+            # Quest/producer carry GOPs (P-frames referencing prior frames), so
+            # a decode-on-grab design under latest_only would skip AUs and
+            # break every reference chain -> full-frame mosaic. Decoding all
+            # keeps NVDEC's reference state valid; latest_only then selects
+            # among DECODED frames. Cost: NVDEC is a dedicated engine (off the
+            # SMs) and the small convert runs on the legacy default stream,
+            # which does NOT implicitly sync with srbag's non-blocking seg/opt
+            # streams — the nvJPEG-era hazard that motivated deferring the
+            # decode left with the jpeg path.
+            frame = self._decode_h264(
+                {'raw_l': bytes(msg_l.data), 'raw_r': bytes(msg_r.data)})
+            if frame is None:
+                return                      # NVDEC warmup (pre-IDR)
         else:
             left_img = _decode_image_msg_to_numpy(msg_l)
             right_img = _decode_image_msg_to_numpy(msg_r)
@@ -250,7 +235,6 @@ class LiveSource(FrameSource):
 
         with self.lock:
             if self.latest_js is None:
-                self._diag["js_gated"] += 1
                 return  # wait for first joint-state before accepting frames
             frame.update({
                 'joint_state': self.latest_js,
@@ -264,17 +248,17 @@ class LiveSource(FrameSource):
                 # depth; this - stamp_us = wire transport.
                 'recv_us': time.time() * 1e6})
             self.queue.append(frame)
-            self._diag["queued"] += 1
             self.frame_counter += 1
         self.new_frame.set()
 
     def _decode_h264(self, frame):
         """NVDEC-decode both eyes (persistent per-eye streams), returning RGB
-        float in [0,1]. NVDEC is a dedicated engine, so the
+        float in [0,1] like the JPEG path. NVDEC is a dedicated engine, so the
         decode runs off the SMs and doesn't contend with seg/opt — only the
         light NV12->RGB convert touches the SMs. Returns None until each eye's
-        NVDEC locks on its first IDR (with the producer's all-intra default,
-        every frame is an IDR, so there's effectively no warmup)."""
+        NVDEC locks on its first IDR. Streams may carry GOPs (Quest bags
+        measured at ~30): the caller feeds every AU in order (see _cb_stereo),
+        so reference chains stay valid regardless of GOP structure."""
         if self._h264_dec_l is None:
             from gpu_h264_codec import GpuH264Decoder
             dev = str(self.device)
@@ -283,27 +267,19 @@ class LiveSource(FrameSource):
         l_u8 = self._h264_dec_l.decode(frame.pop('raw_l'))   # (3,H,W) uint8 cuda rgb | None
         r_u8 = self._h264_dec_r.decode(frame.pop('raw_r'))
         if l_u8 is None or r_u8 is None:
-            self._diag["dec_none"] += 1
             return None                                       # NVDEC warmup (pre-IDR)
         frame['left_img'] = l_u8.float().div_(255.0)
         frame['right_img'] = r_u8.float().div_(255.0)
         # Materialise the frame before the optimiser reads it, WITHOUT a
         # device-wide barrier. NVDEC runs on cudastream=0 and the RGBP clone +
         # float/div above are on the default stream, so syncing only the
-        # default stream guarantees the image is fully written. A device-wide
+        # default stream guarantees the image is fully written. Unlike the
+        # nvJPEG path (own internal stream → needs a global sync), a device-wide
         # synchronize here would block on the in-flight opt(current)‖seg(next)
         # dual-stream work every frame and SERIALISE the pipeline. current_stream
         # waits on the decode only, leaving the opt/seg streams free to overlap.
         torch.cuda.current_stream(self.device).synchronize()
         return frame
-
-    def _decode_compressed(self, frame):
-        """Decode the two compressed eyes on the CALLING (optimiser) thread,
-        sequenced with seg/opt. H.264 -> NVDEC (dedicated engine, off the
-        SMs). The nvJPEG path was removed with the producer's JPEG codec —
-        nvJPEG ran on the SMs, which is exactly the contention this pipeline
-        is built to avoid."""
-        return self._decode_h264(frame)
 
     def _read_impl(self, timeout_sec=10.0, latest_only=False):
         """Pop a frame from the queue, blocking up to `timeout_sec`.
@@ -324,24 +300,12 @@ class LiveSource(FrameSource):
                             self.queue.popleft()
                     frame = self.queue.popleft()
             if frame is not None:
-                # Decode OUTSIDE the lock, on THIS (optimiser) thread, so the
-                # NVDEC handoff is sequenced with the seg/opt the caller is
-                # about to schedule — no spin-thread async fence. No-op for the
-                # raw path (already holds left_img/right_img).
-                if 'raw_l' in frame:
-                    frame = self._decode_compressed(frame)
-                    if frame is None:
-                        continue          # NVDEC warmup (pre-IDR); try next frame
+                # Queue holds fully-decoded frames (both paths): the compressed
+                # path decodes in _cb_stereo so every AU reaches NVDEC in order.
                 return frame
             self.new_frame.clear()
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
-                d = self._diag
-                print(f"[Live] read() timed out — stage counters: "
-                      f"left_msgs={d['l']} right_msgs={d['r']} "
-                      f"sync_pairs={d['pairs']} js_gated={d['js_gated']} "
-                      f"queued={d['queued']} decode_none={d['dec_none']} "
-                      f"js_seen={self.latest_js is not None}")
                 return None
             self.new_frame.wait(timeout=remaining)
 
@@ -370,8 +334,7 @@ def make_source(args, device, left_topic=None, right_topic=None,
         compressed = (args.optimiser_image_transport == "compressed")
     return LiveSource(
         left_topic, right_topic, args.joint_state_topic,
-        device, slop_ms=args.sync_slop_ms, compressed=compressed,
-        image_codec=getattr(args, "image_codec", "h264"))
+        device, slop_ms=args.sync_slop_ms, compressed=compressed)
 
 
 def _make_pose_stamped(H, node, frame_id="left_camera"):
@@ -622,6 +585,181 @@ class HandoffSegPublisher:
                 f"[Handoff] seg-publish failed: {e}")
 
 
+class ReInitManager:
+    """Zero-idle-cost re-initialisation listener for the all-cold seed route.
+
+    Watches /pose_init for a message with a stamp NEWER than the baseline
+    (the original handoff's latched init) and /seed/arm (std_msgs/Bool,
+    latched). On arm=true it resumes /left/segmentation publishing (its own
+    HandoffSegPublisher instance — same model class the handoff used) so the
+    warm resident ESS+FP stack can produce a fresh init; when the fresh
+    /pose_init lands, seg publishing stops and the new 4x4 is handed to the
+    tracking loop for a full DR reset. Between re-inits this costs one idle
+    subscription pair — no compute, no VRAM.
+
+    Workflow (warm seed, seed_warm:=true): press 'r'+Enter in the consumer
+    terminal (or publish /seed/arm true). The resident ESS+FP stack computes
+    behind the opened gate, the persistent recorder publishes a fresh
+    /pose_init, the consumer resets its DR state and self-disarms; the stack
+    idles again (VRAM-only residency).
+    """
+
+    def __init__(self, args, device):
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
+                               QoSDurabilityPolicy, QoSHistoryPolicy)
+        from geometry_msgs.msg import PoseStamped
+        from std_msgs.msg import Bool
+
+        self._args, self._device = args, device
+        self._lock = Lock()
+        self._baseline_ns = None          # stamp of the accepted original init
+        self._fresh = None                # (H 4x4, stamp_ns) awaiting pickup
+        self._armed = False
+        self._seg = None                  # live HandoffSegPublisher when armed
+        self._stop = Event()
+
+        self._node = Node('ipcai_reinit_manager')
+        latched = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST, depth=1)
+        self._node.create_subscription(
+            PoseStamped, args.pose_init_topic, self._on_init, latched)
+        self._node.create_subscription(Bool, '/seed/arm', self._on_arm, latched)
+        self._frozen = False
+        self._node.create_subscription(
+            Bool, '/seed/frozen',
+            lambda m: setattr(self, '_frozen', bool(m.data)), latched)
+        self._arm_pub = self._node.create_publisher(Bool, '/seed/arm', latched)
+        # Clear any STALE latched arm from a previous session/attempt: the
+        # latch persists across restarts, and a stale 'true' would re-freeze
+        # the bag source the moment it starts. A fresh session begins disarmed.
+        _clear = Bool(); _clear.data = False
+        self._arm_pub.publish(_clear)
+
+        self._exec = SingleThreadedExecutor()
+        self._exec.add_node(self._node)
+        self._thread = Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def _spin(self):
+        while not self._stop.is_set():
+            self._exec.spin_once(timeout_sec=0.2)
+            # Deferred seg start: pumping seg before the recorder is wired
+            # drops FP's first poses and can wedge its time-sync — the same
+            # race the original handoff gates on. Start seg only once the
+            # recorder's /pose_init publisher AND its matrix subscription
+            # exist.
+            if getattr(self, '_seg_pending', False) and self._armed:
+                pubs = self._node.count_publishers(self._args.pose_init_topic)
+                subs = self._node.count_subscribers(self._args.matrix_topic)
+                if pubs > 0 and subs > 0:
+                    self._seg_pending = False
+                    print("[ReInit] seed stack ready — resuming "
+                          "/left/segmentation")
+                    self._seg = HandoffSegPublisher(
+                        self._args.seg_image_topic,
+                        self._args.seg_publish_topic,
+                        self._device, pth=self._args.pth,
+                        debug_dir=getattr(self._args, 'seg_debug_dir', ''))
+                    self._exec.add_node(self._seg.node())
+
+    @staticmethod
+    def _stamp_ns(msg):
+        return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+
+    def set_baseline(self):
+        """Call right after the original handoff: whatever init is currently
+        latched becomes the baseline; only strictly newer stamps re-init."""
+        with self._lock:
+            if self._fresh is not None:          # the latched original
+                self._baseline_ns = self._fresh[1]
+                self._fresh = None
+            elif self._baseline_ns is None:
+                self._baseline_ns = 0
+
+    def _on_init(self, msg):
+        H = np.eye(4, dtype=np.float64)
+        q = msg.pose.orientation
+        x, y, z, w = q.x, q.y, q.z, q.w
+        H[:3, :3] = np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+            [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]])
+        H[:3, 3] = [msg.pose.position.x, msg.pose.position.y,
+                    msg.pose.position.z]
+        ns = self._stamp_ns(msg)
+        with self._lock:
+            if self._baseline_ns is not None and ns <= self._baseline_ns:
+                return                             # the latched original replayed
+            self._fresh = (H, ns)
+
+    def _on_arm(self, msg):
+        want = bool(msg.data)
+        if want and not self._armed:
+            self._armed = True
+            self._seg_pending = True
+            print("[ReInit] ARMED: waiting for the seed stack (recorder "
+                  "readiness) before resuming /left/segmentation...")
+        elif not want and self._armed:
+            self._armed = False
+            self._seg_pending = False
+            if self._seg is not None:
+                try:
+                    self._exec.remove_node(self._seg.node())
+                    self._seg.stop()
+                except Exception:
+                    pass
+                self._seg = None
+            print("[ReInit] disarmed: seg publishing stopped.")
+
+    def is_armed(self):
+        return self._armed
+
+    def abort(self):
+        """Give up on the current re-init: disarm (stops seg; the source
+        aborts its re-freeze on the same signal) and resume tracking."""
+        from std_msgs.msg import Bool
+        m = Bool(); m.data = False
+        self._arm_pub.publish(m)
+
+    def status(self):
+        segf = self._seg.frames_published if self._seg is not None else -1
+        pubs = self._node.count_publishers(self._args.pose_init_topic)
+        return (f"armed={self._armed} frozen={self._frozen} "
+                f"seg={'pending' if getattr(self, '_seg_pending', False) else segf} "
+                f"recorder_pubs={pubs}")
+
+    def hold(self):
+        """Estimation must pause: armed (re-init intent) OR the source's
+        stream is actually frozen — whichever signal arrives first."""
+        return self._armed or self._frozen
+
+    def poll(self):
+        """Called once per tracking-loop iteration. Returns a fresh 4x4
+        camera-in-base init exactly once when a re-init lands, else None."""
+        with self._lock:
+            if self._fresh is None or self._baseline_ns is None:
+                return None
+            H, ns = self._fresh
+            self._fresh = None
+            self._baseline_ns = ns
+        if self._armed:
+            from std_msgs.msg import Bool
+            m = Bool(); m.data = False
+            self._arm_pub.publish(m)               # self-disarm -> seg stops
+        t = H[:3, 3]
+        print(f"[ReInit] fresh /pose_init t=[{t[0]:+.3f}, {t[1]:+.3f}, "
+              f"{t[2]:+.3f}] m -> resetting DR to original state")
+        return H
+
+    def close(self):
+        self._stop.set()
+
+
 def do_handoff_seg_and_wait(args, device):
     """Publish /left/segmentation while subscribing to /pose_init. When
     the recorder publishes /pose_init, return the received 4x4 (already
@@ -854,7 +992,7 @@ def build_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Standalone IPCAI consumer for the passthrough_sim pipeline.")
 
-    # Topics. The OPTIMISER reads the producer's native-res H.264 stream so the
+    # Topics. The OPTIMISER reads the producer's native-res JPEG stream so the
     # differentiable render + mask run at full resolution; the seg downsample to
     # 576x960 happens inside srbag.extract_mask. The handoff seg (FP-facing) and
     # ESS/FP stay on the downsampled rectified topics (see --seg-image-topic).
@@ -862,16 +1000,9 @@ def build_args():
     p.add_argument("--right-topic", default="/xr/image_right/compressed")
     p.add_argument("--optimiser-image-transport", choices=["compressed", "raw"],
                    default="compressed",
-                   help="'compressed' = native sensor_msgs/CompressedImage (H.264, "
+                   help="'compressed' = native sensor_msgs/CompressedImage (JPEG, "
                         "GPU-decoded); 'raw' = sensor_msgs/Image. Use 'raw' with "
                         "--left-topic /left/image_rect for the old downsampled path.")
-    p.add_argument("--image-codec", choices=["h264"], default="h264",
-                   help="Codec for the compressed transport (native path). "
-                        "H.264 only: NVDEC decode (dedicated engine, off the "
-                        "SMs, one persistent decoder per eye). The nvJPEG "
-                        "path was removed with the producer's JPEG codec. "
-                        "Only applies when --optimiser-image-transport "
-                        "compressed; IGNORED in --optimiser-res downsampled.")
     p.add_argument("--left-camera-info-topic", default="/left/camera_info_rect")
     p.add_argument("--right-camera-info-topic", default="/right/camera_info_rect")
     # Optimiser runs at NATIVE resolution: its VirtualCamera/scene is built from
@@ -884,7 +1015,7 @@ def build_args():
     p.add_argument("--opt-right-camera-info-topic", default="/xr/image_right/camera_info",
                    help="Native-res right camera_info for the optimiser scene.")
     # Optimiser resolution mode. 'native' (default): scene + render at the
-    # producer's raw resolution, image from --left-topic/--right-topic (H.264).
+    # producer's raw resolution, image from --left-topic/--right-topic (JPEG).
     # 'downsampled': the previous mode — scene from camera_info_rect and image
     # from the rectified --rect-left-topic/--rect-right-topic (raw Image), so
     # the whole optimiser runs at 960x576. Lower fidelity, less compute.
@@ -906,12 +1037,40 @@ def build_args():
     p.add_argument("--extrinsics-file", default=None,
                    help="Use this 4x4 .npy (IPCAI frame) as the init pose "
                         "instead of waiting for /pose_init (disables handoff).")
+    p.add_argument("--reinit-timeout", type=float, default=90.0,
+                   help="Max seconds to wait for a fresh /pose_init "
+                        "during a re-initialisation before aborting "
+                        "(disarm + resume on the previous pose). "
+                        "0 = wait forever.")
     p.add_argument("--pose-init-topic", default="/pose_init")
     p.add_argument("--pose-init-timeout", type=float, default=120.0)
     p.add_argument("--matrix-topic", default="/pose_estimation/pose_matrix_output")
     p.add_argument("--handoff-ready-timeout", type=float, default=20.0)
     p.add_argument("--seg-publish-topic", default="/left/segmentation")
     p.add_argument("--seg-image-topic", default="/left/image_rect")
+    p.add_argument("--viz-layout", choices=["2x2", "3x2"], default="3x2",
+                   help="Display/video composite: 3x2 = overlay + wireframe-"
+                        "DIFFERENCE + segmentation rows (the stereo_ipcai_"
+                        "pipeline reference view); 2x2 omits the difference "
+                        "row.")
+    p.add_argument("--gpu-viz", action="store_true",
+                   help="Enable the GPU-rendered viz panels in the "
+                        "--display-progress window (rendered silhouette + "
+                        "seg-vs-render DIFFERENCE view). Extra GPU work per "
+                        "displayed frame — off for benchmarks.")
+    p.add_argument("--wireframe-thickness", type=int, default=2,
+                   help="Line thickness (px) of the estimate wireframe in "
+                        "the --display-progress window (srbag viz).")
+    p.add_argument("--display-size", default="1280x720", metavar="WxH",
+                   help="Window size for --display-progress (WINDOW_NORMAL: "
+                        "content scales to fit, whatever layout srbag draws). "
+                        "Same fit-to-screen behavior as the old viewer.")
+    p.add_argument("--display-progress", action="store_true",
+                   help="Re-enable srbag's live cv2 window (wireframe "
+                        "overlay on the current frame). Costs a compositor "
+                        "hop on the pipeline machine — keep OFF for "
+                        "benchmarks; the printed Frame-N stats and the "
+                        "headset ghost are the zero-cost instruments.")
     p.add_argument("--seg-debug-dir", default="")
 
     # Robot model
@@ -986,15 +1145,13 @@ def build_args():
     # (no on-screen display, no video, no frame dumping).
     _fixed = dict(
         optimizer="ipcai",
-        display_progress=False,
         save_frames=False, save_frames_dir=None, save_per_frame_npy=False,
-        wireframe_thickness=2,
         save_video=False, video_fps=20, video_codec="mp4v",
-        video_quality=80, video_scale=1.0, video_layout="2x2",
-        gpu_viz=False,
+        video_quality=80, video_scale=1.0,
     )
     for k, v in _fixed.items():
         setattr(args, k, v)
+    args.video_layout = args.viz_layout      # srbag reads video_layout
     return args
 
 
@@ -1025,7 +1182,7 @@ def run(args, device):
     caminfo_timeout = 300.0 if args.handoff else 10.0
     # Optimiser scene resolution follows --optimiser-res:
     #   native (default): scene from the producer's raw-res camera_info, image
-    #     from the native H.264 topics — render + upsampled mask at full res.
+    #     from the native JPEG topics — render + upsampled mask at full res.
     #   downsampled: scene from camera_info_rect, image from the rectified raw
     #     topics — the whole optimiser runs at 960x576 (the previous mode).
     # Either way the seg downsample to 576x960 happens inside srbag.extract_mask.
@@ -1049,12 +1206,6 @@ def run(args, device):
     # pose lands. In downsampled mode the optimiser reads the rectified raw
     # Image topics; in native mode it reads --left-topic/--right-topic.
     if args.optimiser_res == "downsampled":
-        if args.optimiser_image_transport != "compressed":
-            print(f"[Consumer] NOTE: --optimiser-res downsampled reads RAW "
-                  f"rectified Image from '{args.rect_left_topic}'; "
-                  f"--image-codec/--optimiser-image-transport are IGNORED in "
-                  f"this mode (no decode happens in the consumer — the "
-                  f"rectifier did it).")
         source = make_source(args, device,
                              left_topic=args.rect_left_topic,
                              right_topic=args.rect_right_topic,
@@ -1106,7 +1257,46 @@ def run(args, device):
         H_b2l_t = H_b2l_t.unsqueeze(0)
     prev_9d = pk.matrix44_to_se3_9d(H_b2l_t).squeeze(0)
 
-    win = "passthrough_ipcai"      # only used by viz, which is disabled
+    # Re-initialisation route (all-cold seed): idle listener; see ReInitManager.
+    reinit = None
+    if args.handoff:
+        reinit = ReInitManager(args, device)
+        reinit.set_baseline()
+
+        # Keyboard trigger: 'r'+Enter arms a re-init (one key end-to-end
+        # against the warm resident seed stack), 'a'+Enter aborts one in
+        # progress. stdin thread — works with or without the display window.
+        def _kbd():
+            import sys
+            from std_msgs.msg import Bool
+            print("[ReInit] keyboard ready: 'r'+Enter = re-initialise, "
+                  "'a'+Enter = abort")
+            for line in sys.stdin:
+                c = line.strip().lower()
+                if c == 'r':
+                    m = Bool(); m.data = True
+                    reinit._arm_pub.publish(m)
+                    print("[ReInit] 'r' -> armed (re-initialisation "
+                          "requested)")
+                elif c == 'a':
+                    reinit.abort()
+                    print("[ReInit] 'a' -> abort requested")
+        Thread(target=_kbd, daemon=True).start()
+
+    win = "passthrough_ipcai"      # srbag viz window (--display-progress)
+    if getattr(args, "display_progress", False):
+        # Pre-create resizable + sized: srbag's later imshow reuses the named
+        # window, so its composite renders scaled to this size (fit-to-screen,
+        # as before) instead of opening at raw composite resolution.
+        import cv2
+        try:
+            dw, dh = (int(v) for v in args.display_size.lower().split("x"))
+        except Exception:
+            dw, dh = 1280, 720
+            print(f"[Consumer] bad --display-size '{args.display_size}', "
+                  f"using {dw}x{dh}")
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, dw, dh)
     video_writer = None
     seg_events, opt_events, dt_events, iter_rates = [], [], [], []
 
@@ -1158,6 +1348,61 @@ def run(args, device):
                     if _recv_us:
                         lat_wire_ms.append(max(0.0, _recv_us - _stamp_us) / 1000.0)
                         lat_queue_ms.append(max(0.0, _grab_us - _recv_us) / 1000.0)
+
+                # Re-init: while ARMED, estimation PAUSES entirely — the
+                # tracker must not fight FP for the GPU nor keep publishing
+                # possibly-bad poses while the seed stack works. We idle here
+                # (draining the source so frames stay fresh) until the fresh
+                # /pose_init lands, then reset and resume.
+                H_new = None
+                if reinit is not None and reinit.hold():
+                    print("[ReInit] estimation PAUSED while the seed "
+                          "stack re-initialises...")
+                    # Drop the dual-stream pipeline's in-flight state — it is
+                    # tied to pre-pause frames and must not leak across.
+                    prefetched_seg = None
+                    prev_opt_end_event = None
+                    _deadline = (time.perf_counter() + args.reinit_timeout
+                                 if args.reinit_timeout > 0 else None)
+                    _next_status = time.perf_counter() + 5.0
+                    while reinit.hold():
+                        H_new = reinit.poll()      # consumes exactly once
+                        if H_new is not None:
+                            break
+                        now = time.perf_counter()
+                        if now >= _next_status:
+                            _next_status = now + 5.0
+                            print(f"[ReInit] waiting... {reinit.status()}")
+                        if _deadline is not None and now > _deadline:
+                            print(f"[ReInit] TIMEOUT after "
+                                  f"{args.reinit_timeout:.0f}s "
+                                  f"({reinit.status()}) — aborting: "
+                                  f"disarm + resume on the previous pose")
+                            reinit.abort()
+                            break
+                        time.sleep(0.05)
+                        _drain = _read_next()      # keep source drained/fresh
+                        if _drain is not None:
+                            current_frame = _drain
+                    if H_new is None:              # released without an init
+                        print("[ReInit] released without a fresh init — "
+                              "resuming with the previous pose")
+                    next_frame = _read_next()
+
+                # A fresh /pose_init resets the DR to original state — new
+                # seed pose, optimiser (and all its caches) rebuilt,
+                # in-flight seg/events dropped.
+                if reinit is not None and H_new is None:
+                    H_new = reinit.poll()          # non-paused arrival path
+                if H_new is not None:
+                        H_b2l_new = np.linalg.inv(H_new)
+                        _t = torch.from_numpy(H_b2l_new).float().to(device)
+                        if _t.dim() == 2:
+                            _t = _t.unsqueeze(0)
+                        prev_9d = pk.matrix44_to_se3_9d(_t).squeeze(0)
+                        opt = None
+                        prefetched_seg = None
+                        prev_opt_end_event = None
 
                 t_frame_start = time.perf_counter()
                 (prev_9d, opt, opt_end_event, _interval, _frame_error,
