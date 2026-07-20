@@ -1113,6 +1113,83 @@ function getPoseTopic(): string {
 // Consumer-driven feed for passthrough. Same setPose* contract as the data
 // channel. roslib is imported lazily so the data-channel build doesn't bundle
 // it (and you don't need roslib installed unless you use this transport).
+// --- head pose -> ROS (/xr/head_pose_cloudxr) ------------------------------
+// While this CloudXR session is foreground, HorizonOS withholds tracking
+// from the APK's OpenXR session (verified: xrLocateSpace succeeds with zero
+// validity flags) — so the WebXR session is the ONLY pose source during the
+// session. RAW poses in this session's 'local' space go to
+// /xr/head_pose_cloudxr; the zenoh receiver re-anchors them into the
+// unified (APK LOCAL) frame and republishes /xr/head_pose.
+//
+// Hard-learned rules encoded here:
+//  * NEVER publish before the 'local' space request resolves — publishing
+//    a few first frames in the session render space and then switching
+//    poisons the receiver's anchor with a constant offset.
+//  * Reset ALL per-session state in startHeadPosePublisher — reference
+//    spaces belong to one session; a reconnect must re-request them.
+let _headPosePub: any = null;
+let _headPoseRefSpace: XRReferenceSpace | null = null;
+let _headPoseSpaceRequested = false;
+let _headPoseN = 0;
+
+async function startHeadPosePublisher() {
+  // Per-session reset (called from onWebGLInitialized on every connect).
+  _headPoseRefSpace = null;
+  _headPoseSpaceRequested = false;
+  _headPoseN = 0;
+  if (_headPosePub) return;                 // ros connection persists
+  try {
+    const ROSLIB: any = await import('roslib');
+    const ros = new ROSLIB.Ros({ url: ROSBRIDGE_URL });
+    ros.on('connection', () =>
+      console.info('[headpose] rosbridge connected -> /xr/head_pose_cloudxr'));
+    ros.on('error', (e: any) => console.error('[headpose] rosbridge error', e));
+    ros.on('close', () => console.warn('[headpose] rosbridge closed'));
+    _headPosePub = new ROSLIB.Topic({
+      ros, name: '/xr/head_pose_cloudxr',
+      messageType: 'geometry_msgs/PoseStamped',
+      queue_size: 1,
+    });
+  } catch (e) {
+    console.warn('[headpose] publisher setup failed (non-fatal):', e);
+  }
+}
+
+function publishHeadPose(frame: XRFrame) {
+  if (!_headPosePub) return;
+  if (!_headPoseSpaceRequested) {
+    _headPoseSpaceRequested = true;
+    frame.session.requestReferenceSpace('local')
+      .then((s: XRReferenceSpace) => {
+        _headPoseRefSpace = s;
+        console.info("[headpose] 'local' space resolved — publishing "
+                     + 'per-session 6DoF poses (uncapped, frame rate)');
+      })
+      .catch(() => console.warn(
+        "[headpose] 'local' space unavailable — head pose uplink DISABLED "
+        + 'for this session (never publishing in a mixed frame)'));
+    return;
+  }
+  if (!_headPoseRefSpace) return;           // wait for 'local'; never mix
+  const vp = frame.getViewerPose(_headPoseRefSpace);
+  if (!vp) return;
+  const p = vp.transform.position;
+  const q = vp.transform.orientation;
+  const tMs = Date.now();
+  _headPosePub.publish({
+    header: {
+      stamp: { sec: Math.floor(tMs / 1000), nanosec: (tMs % 1000) * 1e6 },
+      frame_id: 'quest_cloudxr_local',
+    },
+    pose: {
+      position: { x: p.x, y: p.y, z: p.z },
+      orientation: { x: q.x, y: q.y, z: q.z, w: q.w },
+    },
+  });
+  _headPoseN++;
+  if (_headPoseN === 1) console.info('[headpose] first pose published');
+}
+
 async function startPoseFeedRosbridge(overlay: OverlayModule) {
   const ROSLIB: any = await import('roslib');
   const ros = new ROSLIB.Ros({ url: ROSBRIDGE_URL });
@@ -1207,6 +1284,7 @@ document.addEventListener('DOMContentLoaded', () => {
       overlay.init(gl, referenceSpace);
       await overlay.loadURDF('https://192.168.1.154:8443/lbr_med7_r800.urdf');
       if (getTransport() === 'rosbridge') startPoseFeedRosbridge(overlay);
+      startHeadPosePublisher();             // per-session reset + (re)start
     },
     // CloudXR data channel: hand us the Session to read its message channel.
     onSession: (session) => {
@@ -1214,6 +1292,7 @@ document.addEventListener('DOMContentLoaded', () => {
     },
     onXRFrame: async (_t, frame, _gl, baseLayer) => {
       overlay.render(frame, baseLayer);
+      publishHeadPose(frame);
     },
   });
 });
